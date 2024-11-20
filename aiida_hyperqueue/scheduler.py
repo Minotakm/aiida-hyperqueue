@@ -9,13 +9,14 @@
 ###########################################################################
 """Plugin for the HyperQueue meta scheduler."""
 
+
 import json
 import typing as t
 import warnings
 
 from aiida.common.extendeddicts import AttributeDict
 from aiida.schedulers import Scheduler, SchedulerError
-from aiida.schedulers.datastructures import JobInfo, JobState, JobResource, JobTemplate
+from aiida.schedulers.datastructures import JobInfo, JobState, NodeNumberJobResource, JobResource, JobTemplate
 
 # Mapping of HyperQueue states to AiiDA `JobState`s
 _MAP_STATUS_HYPERQUEUE = {
@@ -31,10 +32,10 @@ class AiiDAHypereQueueDeprecationWarning(Warning):
     """Class for HypereQueue plugin deprecations."""
 
 
-class HyperQueueJobResource(JobResource):
+class HyperQueueJobResource(NodeNumberJobResource):
     """Class for HyperQueue job resources."""
 
-    _default_fields = ("num_cpus", "memory_mb")
+    _default_fields = ("num_machines","num_cpus", "memory_mb", "num_mpiprocs_per_machine")
 
     _features = {
         "can_query_by_user": False,
@@ -57,53 +58,20 @@ class HyperQueueJobResource(JobResource):
         :return: attribute dictionary with the parsed parameters populated
         :raises ValueError: if the resources are invalid or incomplete
         """
-        resources = AttributeDict()
+        resources = super().validate_resources(**kwargs)
 
         try:
-            resources.num_cpus = kwargs.pop("num_cpus")
-        except KeyError:
-            try:
-                # For backward compatibility where `num_machines` and `num_mpiprocs_per_machine` are setting
-                # TODO: I only setting the default value as 1 for `num_mpiprocs_per_machine` because aiida-quantumespresso override
-                # resources default with `num_machines` set to 1 and then get builder with such setting.
-                # The `num_mpiprocs_per_machine` sometime can be read from "Default #procs/machine" of computer setup but if it is not exist
-                # the builder can not be properly get without passing `option` to builder generator.
-                # It is anyway a workaround for backward compatibility so this default is implemented despite it is quite specific for the qe plugin.
-                resources.num_cpus = kwargs.pop("num_machines") * kwargs.pop(
-                    "num_mpiprocs_per_machine", 1
-                )
-            except KeyError:
-                raise KeyError(
-                    "Must specify `num_cpus`, or (`num_machines` and `num_mpiprocs_per_machine`)"
-                )
-            else:
-                message = "The `num_machines` and `num_mpiprocs_per_machine` for setting hyperqueue resources are deprecated. "
-                "Please set `num_cpus` and `memory_mb`."
-
-                message = f"{message} (this will be removed in aiida-hyperqueue v1.0)"
-                warnings.warn(message, AiiDAHypereQueueDeprecationWarning, stacklevel=3)
-        else:
-            if not isinstance(resources.num_cpus, int):
-                raise ValueError("`num_cpus` must be an integer")
+            resources.num_cores_per_machine = int(kwargs.pop('num_cores_per_machine'))
+        except (KeyError,ValueError) as exception:
+            raise ValueError('`num_cores_per_machine` must be specified and must be an integer') from exception
 
         try:
-            resources.memory_mb = kwargs.pop("memory_mb")
-        except KeyError:
-            resources.memory_mb = None  # Use all availble the memory on the worker
-        else:
-            if not isinstance(resources.memory_mb, int):
-                raise ValueError("`memory_mb` must be an integer")
+            resources.memory_mb = int(kwargs.pop("memory_mb", 0)) 
+        except ValueError as exception:
+            raise ValueError("`memory_mb` must be an integer") from exception
 
         return resources
 
-    @classmethod
-    def accepts_default_mpiprocs_per_machine(cls):
-        """Return True if this subclass accepts a `default_mpiprocs_per_machine` key, False otherwise."""
-        return False
-
-    def get_tot_num_mpiprocs(self):
-        """Return the total number of cpus of this job resource."""
-        return self.num_cpus
 
 
 class HyperQueueScheduler(Scheduler):
@@ -152,12 +120,19 @@ class HyperQueueScheduler(Scheduler):
                 f"{prefix} --time-limit={job_tmpl.max_wallclock_seconds}s"
             )
 
+        if job_tmpl.job_resource.num_machines > 1:
+            hq_options.append(f'{prefix} --nodes={job_tmpl.job_resource.num_machines}')
+            # HQ will request the full resources in case of multi-node tasks
+            # https://it4innovations.github.io/hyperqueue/v0.19.0/jobs/multinode/
+            # Moreover, --cpus and --nodes are mutual exlusive
+        elif job_tmpl.job_resource.num_cores_per_machine:
+            hq_options.append(
+                f'{prefix} --cpus={job_tmpl.job_resource.num_cores_per_machine}')
+
         if job_tmpl.priority:
             # HQ jobs can be assigned priority, where jobs with a higher priority will be executed first. The default
             # priority is 0.
             hq_options.append(f"{prefix} --priority={job_tmpl.priority}")
-
-        hq_options.append(f"{prefix} --cpus={job_tmpl.job_resource.num_cpus}")
 
         mem = job_tmpl.job_resource.memory_mb
         if mem is not None:
@@ -166,18 +141,20 @@ class HyperQueueScheduler(Scheduler):
         return "\n".join(hq_options)
 
     def _get_submit_command(self, submit_script: str) -> str:
-        """Return the string to execute to submit a given script.
-
-        Args:
-            submit_script: the path of the submit script relative to the working
-                directory.
-        """
-        submit_command = f"hq submit --output-mode=json {submit_script}"
-
-        self.logger.info(f"Submitting with: {submit_command}")
-
-        return submit_command
-
+            """
+            Return the string to execute to submit a given script.
+            Args:
+                submit_script: the path of the submit script relative to the working
+                    directory.
+            """
+            submit_command = (
+                f"chmod 774 {submit_script}; options=$(grep '#HQ' {submit_script});"
+                f"sed -i s/\\'srun\\'/srun\ --cpu-bind=map_cpu:\$HQ_CPUS/  {submit_script};"
+                f'hq job submit ${{options:3}} ./{submit_script}')
+            self.logger.info(f'submitting with: {submit_command}')
+            return submit_command
+    
+    
     def _parse_submit_output(self, retval: int, stdout: str, stderr: str) -> str:
         """Parse the output of the submit command, as returned by executing the
         command returned by _get_submit_command command.
@@ -243,7 +220,7 @@ class HyperQueueScheduler(Scheduler):
             self.logger.warning(
                 f"`hq job list` returned exit code 0 (_parse_joblist_output function) but non-empty stderr='{stderr.strip()}'"
             )
-
+        
         # convert hq returned job list to job info list
         # HQ support 1 hq job with multiple tasks.
         # Since the way aiida-hq using hq is 1-1 match between hq job and hq task, we only parse 1 task as aiida job.
